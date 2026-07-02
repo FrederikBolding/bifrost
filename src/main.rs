@@ -1,14 +1,15 @@
 use anyhow::{Result, anyhow};
+use blake3::{Hash, Hasher};
 use iroh::{
     Endpoint,
     endpoint::{Connection, RecvStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_tickets::{Ticket, endpoint::EndpointTicket};
-use std::env;
 use std::sync::Arc;
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use std::{env, fs};
 use tokio::{fs::File, io::AsyncReadExt};
+use tokio::{io::AsyncWriteExt, sync::Mutex};
 
 const ALPN: &[u8; 10] = b"bifrost/v0";
 
@@ -25,12 +26,12 @@ async fn main() -> Result<()> {
         return receive(ticket).await;
     }
 
-    let file = File::open(file_or_ticket).await?;
+    let file = fs::read(file_or_ticket)?;
 
     send(file).await
 }
 
-async fn send(file: File) -> Result<()> {
+async fn send(file: Vec<u8>) -> Result<()> {
     let endpoint = Endpoint::bind(presets::N0).await?;
 
     endpoint.online().await;
@@ -61,9 +62,19 @@ async fn receive(ticket: EndpointTicket) -> Result<()> {
 
     send.write_all(b"START").await?;
 
+    let received_hash = recv_bytes(&mut recv, 32).await?;
+
     let response = recv.read_to_end(100_000_000).await?;
 
     println!("[bifrost] Received {} bytes", response.len());
+
+    let computed_hash = blake3_hash(&response);
+
+    let hash_verified = received_hash == computed_hash.as_bytes();
+
+    if !hash_verified {
+        return Err(anyhow!("[bifrost] Invalid file received."));
+    }
 
     send.write_all(b"OK").await?;
     send.finish()?;
@@ -78,7 +89,8 @@ async fn receive(ticket: EndpointTicket) -> Result<()> {
 }
 #[derive(Debug)]
 struct Bifrost {
-    file: Arc<Mutex<File>>,
+    file: Vec<u8>,
+    hash: Hash,
 }
 
 impl ProtocolHandler for Bifrost {
@@ -88,14 +100,16 @@ impl ProtocolHandler for Bifrost {
 
         let _request = recv_bytes(&mut recv, 5).await.unwrap();
 
-        let mut file = self.file.lock().await;
+        let mut file = &self.file;
+
+        send.write_all(self.hash.as_bytes()).await.unwrap();
 
         // TODO
         // Sender: Hash, compress, send
         // Receiver: Receive, decompress, hash
-        let bytes_sent = tokio::io::copy(&mut *file, &mut send).await.unwrap();
+        send.write_all(&self.file).await.unwrap();
 
-        println!("[bifrost] Sent {} bytes", bytes_sent);
+        println!("[bifrost] Sent {} bytes", file.len());
 
         send.finish()?;
 
@@ -108,9 +122,10 @@ impl ProtocolHandler for Bifrost {
 }
 
 impl Bifrost {
-    pub fn new(file: File) -> Self {
+    pub fn new(file: Vec<u8>) -> Self {
         Self {
-            file: Arc::new(Mutex::new(file)),
+            hash: blake3_hash(&file),
+            file,
         }
     }
 }
@@ -119,4 +134,10 @@ async fn recv_bytes(stream: &mut RecvStream, length: usize) -> Result<Vec<u8>> {
     let mut buffer = vec![0u8; length];
     stream.read_exact(&mut buffer).await?;
     Ok(buffer)
+}
+
+fn blake3_hash(file: &Vec<u8>) -> Hash {
+    let mut hasher = Hasher::new();
+    hasher.update(file);
+    hasher.finalize()
 }
