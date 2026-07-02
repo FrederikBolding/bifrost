@@ -6,10 +6,9 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_tickets::{Ticket, endpoint::EndpointTicket};
-use std::sync::Arc;
 use std::{env, fs};
-use tokio::{fs::File, io::AsyncReadExt};
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 
 const ALPN: &[u8; 10] = b"bifrost/v0";
 
@@ -64,7 +63,10 @@ async fn receive(ticket: EndpointTicket) -> Result<()> {
 
     let received_hash = recv_bytes(&mut recv, 32).await?;
 
-    let response = recv.read_to_end(100_000_000).await?;
+    let size_bytes = recv_bytes(&mut recv, std::mem::size_of::<usize>()).await?;
+    let size = usize::from_be_bytes(size_bytes.try_into().unwrap());
+
+    let response = recv.read_to_end(size).await?;
 
     println!("[bifrost] Received {} bytes", response.len());
 
@@ -100,9 +102,10 @@ impl ProtocolHandler for Bifrost {
 
         let _request = recv_bytes(&mut recv, 5).await.unwrap();
 
-        let mut file = &self.file;
+        let file = &self.file;
 
         send.write_all(self.hash.as_bytes()).await.unwrap();
+        send.write_all(&file.len().to_be_bytes()).await.unwrap();
 
         // TODO
         // Sender: Hash, compress, send
