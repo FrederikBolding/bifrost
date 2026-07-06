@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use async_compression::tokio::write::{Lz4Decoder, Lz4Encoder};
 use blake3::{Hash, Hasher};
 use iroh::{
     Endpoint,
@@ -53,21 +54,21 @@ async fn send(file: Vec<u8>) -> Result<()> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     println!("[bifrost] Connection established!");
 
-    let _request = recv_bytes(&mut recv, 5).await.unwrap();
+    let _request = recv_bytes(&mut recv, 5).await?;
 
-    send.write_all(hash.as_bytes()).await.unwrap();
-    send.write_all(&file.len().to_be_bytes()).await.unwrap();
+    send.write_all(hash.as_bytes()).await?;
+    send.write_all(&file.len().to_be_bytes()).await?;
 
-    // TODO
-    // Sender: Hash, compress, send
-    // Receiver: Receive, decompress, hash
-    send.write_all(&file).await.unwrap();
+    let mut encoder = Lz4Encoder::new(&mut send);
+
+    encoder.write_all(&file).await?;
+    encoder.flush().await?;
 
     println!("[bifrost] Sent {} bytes", file.len());
 
     send.finish()?;
 
-    let _response = recv_bytes(&mut recv, 2).await.unwrap();
+    let _response = recv_bytes(&mut recv, 2).await?;
 
     connection.close(0u32.into(), b"OK");
 
@@ -94,11 +95,16 @@ async fn receive(ticket: EndpointTicket) -> Result<()> {
     let size_bytes = recv_bytes(&mut recv, std::mem::size_of::<usize>()).await?;
     let size = usize::from_be_bytes(size_bytes.try_into().unwrap());
 
-    let response = recv.read_to_end(size).await?;
+    let mut response_buf = Vec::with_capacity(size);
 
-    println!("[bifrost] Received {} bytes", response.len());
+    let mut decoder = Lz4Decoder::new(&mut response_buf);
 
-    let computed_hash = blake3_hash(&response);
+    let _bytes_received = tokio::io::copy(&mut recv, &mut decoder).await?;
+    decoder.flush().await?;
+
+    println!("[bifrost] Received {} bytes", response_buf.len());
+
+    let computed_hash = blake3_hash(&response_buf);
 
     let hash_verified = received_hash == computed_hash.as_bytes();
 
@@ -113,7 +119,7 @@ async fn receive(ticket: EndpointTicket) -> Result<()> {
 
     let mut file = File::create("out.bin").await?;
 
-    file.write_all(&response).await?;
+    file.write_all(&response_buf).await?;
 
     Ok(())
 }
