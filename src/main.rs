@@ -6,7 +6,7 @@ use iroh::{
     endpoint::{RecvStream, presets},
 };
 use iroh_tickets::{Ticket, endpoint::EndpointTicket};
-use std::{env, fs};
+use std::{env, fs, path::Path};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
@@ -25,12 +25,16 @@ async fn main() -> Result<()> {
         return receive(ticket).await;
     }
 
-    let file = fs::read(file_or_ticket)?;
-
-    send(file).await
+    send(Path::new(&file_or_ticket)).await
 }
 
-async fn send(file: Vec<u8>) -> Result<()> {
+async fn send(file_path: &Path) -> Result<()> {
+    let metadata = tokio::fs::metadata(file_path).await?;
+
+    let file = fs::read(file_path)?;
+
+    let file_size = metadata.len();
+
     let hash = blake3_hash(&file);
 
     let endpoint = Endpoint::builder(presets::N0)
@@ -57,7 +61,7 @@ async fn send(file: Vec<u8>) -> Result<()> {
     let _request = recv_bytes(&mut recv, 5).await?;
 
     send.write_all(hash.as_bytes()).await?;
-    send.write_all(&file.len().to_be_bytes()).await?;
+    send.write_all(&file_size.to_be_bytes()).await?;
 
     let mut encoder = Lz4Encoder::new(&mut send);
 
@@ -92,19 +96,30 @@ async fn receive(ticket: EndpointTicket) -> Result<()> {
 
     let received_hash = recv_bytes(&mut recv, 32).await?;
 
-    let size_bytes = recv_bytes(&mut recv, std::mem::size_of::<usize>()).await?;
-    let size = usize::from_be_bytes(size_bytes.try_into().unwrap());
+    let file_name = "out.bin";
+    let size_bytes = recv_bytes(&mut recv, std::mem::size_of::<u64>()).await?;
+    let size = u64::from_be_bytes(size_bytes.try_into().unwrap());
 
-    let mut response_buf = Vec::with_capacity(size);
+    let mut file = File::create(file_name).await?;
 
-    let mut decoder = Lz4Decoder::new(&mut response_buf);
+    let mut decoder = Lz4Decoder::new(&mut file);
 
-    let _bytes_received = tokio::io::copy(&mut recv, &mut decoder).await?;
+    tokio::io::copy(&mut recv, &mut decoder).await?;
     decoder.flush().await?;
 
-    println!("[bifrost] Received {} bytes", response_buf.len());
+    let metadata = tokio::fs::metadata(file_name).await?;
 
-    let computed_hash = blake3_hash(&response_buf);
+    let received_bytes = metadata.len();
+
+    if received_bytes != size {
+        return Err(anyhow!("[bifrost] Invalid file size."));
+    }
+
+    println!("[bifrost] Received {} bytes", received_bytes);
+
+    let file = fs::read(file_name)?;
+
+    let computed_hash = blake3_hash(&file);
 
     let hash_verified = received_hash == computed_hash.as_bytes();
 
@@ -116,10 +131,6 @@ async fn receive(ticket: EndpointTicket) -> Result<()> {
     send.finish()?;
 
     connection.closed().await;
-
-    let mut file = File::create("out.bin").await?;
-
-    file.write_all(&response_buf).await?;
 
     Ok(())
 }
